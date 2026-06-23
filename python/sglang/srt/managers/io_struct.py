@@ -2191,6 +2191,22 @@ class DumperControlReqOutput(BaseReq):
     error: str = ""
 
 
+def sock_send(socket, obj, flags=0):
+    socket.send_pyobj(obj, flags=flags)
+
+
+def sock_recv(socket, flags=0):
+    return socket.recv_pyobj(flags=flags)
+
+
+async def async_sock_send(socket, obj, flags=0):
+    await socket.send_pyobj(obj, flags=flags)
+
+
+async def async_sock_recv(socket, flags=0):
+    return await socket.recv_pyobj(flags=flags)
+
+
 def _check_all_req_types():
     """A helper function to check all request types are defined in this file."""
     import inspect

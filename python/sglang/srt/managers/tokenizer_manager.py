@@ -75,6 +75,7 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
+    async_sock_recv,
 )
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.mm_utils import TensorTransportMode, wrap_shm_features
@@ -1825,7 +1826,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         """The event loop that handles requests"""
         while True:
             with self.soft_watchdog.disable():
-                recv_obj = await self.recv_from_detokenizer.recv_pyobj()
+                recv_obj = await async_sock_recv(self.recv_from_detokenizer)
             if isinstance(
                 recv_obj,
                 (BatchStrOutput, BatchEmbeddingOutput, BatchTokenIDOutput),
