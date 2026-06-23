@@ -12,6 +12,8 @@ from typing import (
     Tuple,
 )
 
+import torch
+
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
@@ -262,6 +264,79 @@ class SchedulerInvariantChecker:
 
         assert not full_leak, f"Full Pool Mem Leak Detected! {full_msg}"
         assert not swa_leak, f"SWA Pool Mem Leak Detected! {swa_msg}"
+
+        if envs.SGLANG_CHECK_KV_PAGE_INVARIANTS.get():
+            self._check_kv_page_invariants()
+
+    def _check_kv_page_invariants(self):
+        """committed<=allocated for every req/slot, and no double free:
+          A. no owner's req_to_token references a page that is in the free pool
+             (use-after-free — the page was freed but an owner still holds it).
+          B. the free pool itself has no duplicate pages (two owners freed the
+             same page).
+        All heavy work runs on GPU to avoid per-token device->host sync."""
+        rtt = self.req_to_token_pool.req_to_token
+        row_width = rtt.shape[1]
+
+        owners: list[tuple[str, Optional[int], int]] = []
+        batch = self.get_last_batch()
+        if batch is not None:
+            for req in batch.reqs:
+                assert 0 <= req.kv_committed_len <= req.kv_allocated_len <= row_width
+                owners.append(
+                    (f"req {req.rid}", req.req_pool_idx, req.kv_allocated_len)
+                )
+        sess = getattr(self.tree_cache, "slots", None)
+        if sess:
+            for sid, slot in sess.items():
+                if not getattr(slot, "is_holding_kv", False):
+                    continue
+                assert 0 <= slot.kv_committed_len <= slot.kv_allocated_len <= row_width
+                owners.append(
+                    (f"slot {sid[:8]}", slot.req_pool_idx, slot.kv_allocated_len)
+                )
+
+        active = [
+            (label, rpi, al) for label, rpi, al in owners if rpi is not None and al > 0
+        ]
+        if not active:
+            return
+        idx = torch.as_tensor([rpi for _, rpi, _ in active], device=rtt.device)
+        allocs = torch.as_tensor([al for _, _, al in active], device=rtt.device)
+        mask = torch.arange(row_width, device=rtt.device)[None, :] < allocs[:, None]
+        owner_pages = rtt[idx][mask] // self.page_size
+
+        # The full free set is free_pages + release_pages (release_pages are
+        # batched frees not yet merged back into free_pages).
+        alloc = self.token_to_kv_pool_allocator
+        free = alloc.free_pages
+        if len(alloc.release_pages) > 0:
+            free = torch.cat((free, alloc.release_pages))
+
+        # Check B: free pool itself has no duplicate pages.
+        unique_free = torch.unique(free)
+        if unique_free.numel() != free.numel():
+            raise_error_or_warn(
+                self,
+                envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.get(),
+                "count_memory_leak_warnings",
+                f"KV double free: free pool has {free.numel() - unique_free.numel()} "
+                f"duplicate pages.",
+            )
+
+        # Check A: no owner references a page that is in the free pool
+        # (use-after-free). torch.isin is GPU; .sum().item() is the one sync,
+        # only to decide whether to build the error message.
+        stale = owner_pages[torch.isin(owner_pages, unique_free)]
+        if stale.numel() > 0:
+            sample = torch.unique(stale)[:8].tolist()
+            raise_error_or_warn(
+                self,
+                envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.get(),
+                "count_memory_leak_warnings",
+                f"KV page use-after-free: {stale.numel()} owner page refs "
+                f"are in the free pool, sample pages={sample}.",
+            )
 
     def _check_req_pool(self):
         if self.disaggregation_mode == DisaggregationMode.DECODE:
