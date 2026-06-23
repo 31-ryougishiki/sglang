@@ -55,6 +55,7 @@ from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
+    BaseReq,
     BatchEmbeddingOutput,
     BatchStrOutput,
     BatchTokenIDOutput,
@@ -3134,8 +3135,6 @@ class SenderWrapper:
     def _stamp_http_worker_ipc(self, obj):
         if not self.attach_multi_http_worker_info:
             return
-        from sglang.srt.managers.io_struct import BaseReq
-
         if isinstance(obj, BaseReq):
             obj.http_worker_ipc = self.port_args.tokenizer_ipc_name
 
