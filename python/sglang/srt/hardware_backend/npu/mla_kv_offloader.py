@@ -27,7 +27,8 @@ Usage::
 from __future__ import annotations
 
 import logging
-from typing import List, Optional, Tuple
+import os
+from typing import List, Literal, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -86,27 +87,42 @@ class MLAKVOffloader:
     index_head_dim:
         Optional dimension for the indexer K buffer (DSA / DeepSeek).
     enable_k_buffer_sharing:
-        When *False* every rank allocates a full *k_buffer* for every
-        layer (same as the non-shared baseline).
+        Set to *True* to share *k_buffer* across ranks.  Default *False*.
     enable_v_buffer_sharing:
-        When *False* every rank allocates a full *v_buffer* for every
-        layer.
+        Set to *True* to share *v_buffer* across ranks.  Default *False*.
     enable_index_k_sharing:
-        When *False* every rank allocates a full *index_k_buffer* for
-        every layer.
+        Set to *True* to share *index_k_buffer* across ranks.  Default *False*.
+    sharing_stride:
+        Which layers participate in KV sharing.  ``"all"`` (default)
+        shares every layer; ``"even"`` shares only even-indexed local
+        layers; ``"odd"`` shares only odd-indexed local layers.
+        Non-participating layers use dedicated buffers with zero
+        communication overhead.  Override via
+        ``ASCEND_MLA_KV_SHARING_STRIDE``.
     offload_group:
         Optional pre-created ``ProcessGroup``.  If *None* a new group
         containing ranks ``[0, tp_size)`` is created.
 
     Environment variables
     ---------------------
-    ``ASCEND_MLA_KV_SHARING`` (bool, default ``"True"``):
-        Master switch – when ``"False"`` all sharing is disabled and every
-        rank allocates full, dedicated buffers for all layers.
-    ``ASCEND_MLA_KV_K_SHARING`` (bool, default ``"True"``):
+    ``ASCEND_MLA_KV_SHARING`` (bool, default ``"False"``):
+        Master switch – set to ``"True"`` to enable KV buffer sharing.
+        By default every rank allocates full, dedicated buffers for all layers.
+    ``ASCEND_MLA_KV_K_SHARING`` (bool, default ``"False"``):
         Enable *k_buffer* sharing.
-    ``ASCEND_MLA_KV_V_SHARING`` (bool, default ``"True"``):
+    ``ASCEND_MLA_KV_V_SHARING`` (bool, default ``"False"``):
         Enable *v_buffer* sharing.
+    ``ASCEND_MLA_KV_SHARING_STRIDE`` (``"all"``, ``"even"`` or ``"odd"``,
+        default ``"all"``):
+        Controls which layers participate in KV sharing.
+
+        * ``"all"`` – every layer is shared (maximum memory savings).
+        * ``"even"`` – only even-indexed local layers participate.
+        * ``"odd"`` – only odd-indexed local layers participate.
+
+        Non-participating layers allocate dedicated buffers on every rank
+        (no communication).  This gives the async ``isend`` / ``irecv``
+        pipeline more time to drain between shared layers.
     """
 
     # ------------------------------------------------------------------
@@ -126,9 +142,10 @@ class MLAKVOffloader:
         size: int,
         page_size: int,
         index_head_dim: Optional[int] = None,
-        enable_k_buffer_sharing: bool = True,
-        enable_v_buffer_sharing: bool = True,
-        enable_index_k_sharing: bool = True,
+        enable_k_buffer_sharing: bool = False,
+        enable_v_buffer_sharing: bool = False,
+        enable_index_k_sharing: bool = False,
+        sharing_stride: Literal["all", "even", "odd"] = "all",
         offload_group: Optional[dist.ProcessGroup] = None,
     ):
         # -- basic parameters --
@@ -144,23 +161,31 @@ class MLAKVOffloader:
         self.index_head_dim = index_head_dim
 
         # -- master switch --
-        self._enabled = get_bool_env_var("ASCEND_MLA_KV_SHARING", "True")
+        self._enabled = get_bool_env_var("ASCEND_MLA_KV_SHARING", "False")
         if not self._enabled:
             enable_k_buffer_sharing = False
             enable_v_buffer_sharing = False
             enable_index_k_sharing = False
+
+        # -- stride: which layers participate --
+        _env_stride = os.environ.get("ASCEND_MLA_KV_SHARING_STRIDE", sharing_stride)
+        self._sharing_stride: Literal["all", "even", "odd"] = _env_stride  # type: ignore[assignment]
 
         # -- per-buffer-type switches --
         self._share_k = enable_k_buffer_sharing and tp_size > 1
         self._share_v = enable_v_buffer_sharing and tp_size > 1
         self._share_ik = enable_index_k_sharing and index_head_dim is not None and tp_size > 1
 
-        # -- layer ownership (round-robin) --
+        # -- layer ownership (round-robin, only sharing-participating layers) --
         self._owned_layers: List[int] = sorted(
-            i for i in range(layer_num) if i % tp_size == tp_rank
+            i
+            for i in range(layer_num)
+            if i % tp_size == tp_rank and self._is_sharing_layer(i)
         )
         self._recv_layers: List[int] = sorted(
-            i for i in range(layer_num) if i % tp_size != tp_rank
+            i
+            for i in range(layer_num)
+            if i % tp_size != tp_rank and self._is_sharing_layer(i)
         )
 
         # -- communication group --
@@ -192,6 +217,20 @@ class MLAKVOffloader:
         self._allocate_buffers()
 
     # ------------------------------------------------------------------
+    # Sharing participation
+    # ------------------------------------------------------------------
+
+    def _is_sharing_layer(self, local_layer_id: int) -> bool:
+        """Return *True* if *local_layer_id* participates in KV sharing."""
+        if self._sharing_stride == "all":
+            return True
+        if self._sharing_stride == "even":
+            return local_layer_id % 2 == 0
+        if self._sharing_stride == "odd":
+            return local_layer_id % 2 == 1
+        return True  # unreachable
+
+    # ------------------------------------------------------------------
     # Buffer allocation
     # ------------------------------------------------------------------
 
@@ -217,12 +256,16 @@ class MLAKVOffloader:
         self.index_k_buffer = [] if self.index_head_dim is not None else None
 
         for local_id in range(self.layer_num):
-            if local_id in self._owned_layers:
-                # Owned layer → dedicated tensor
+            # Non-sharing layers always get dedicated buffers
+            if not self._is_sharing_layer(local_id):
+                k_buf = torch.zeros(k_shape, dtype=self.store_dtype, device=self.device)
+                v_buf = torch.zeros(v_shape, dtype=self.store_dtype, device=self.device)
+            elif local_id in self._owned_layers:
+                # Owned sharing layer → dedicated tensor
                 k_buf = torch.zeros(k_shape, dtype=self.store_dtype, device=self.device)
                 v_buf = torch.zeros(v_shape, dtype=self.store_dtype, device=self.device)
             else:
-                # Non-owned layer → shared tensor (or dedicated if sharing disabled)
+                # Non-owned sharing layer → shared tensor (or dedicated if sharing disabled)
                 k_buf = (
                     shared_k
                     if self._share_k
@@ -238,7 +281,13 @@ class MLAKVOffloader:
             self.v_buffer.append(v_buf)
 
             if self.index_head_dim is not None:
-                if local_id in self._owned_layers:
+                if not self._is_sharing_layer(local_id):
+                    ik = torch.zeros(
+                        (num_pages, self.page_size, 1, self.index_head_dim),
+                        dtype=self.store_dtype,
+                        device=self.device,
+                    )
+                elif local_id in self._owned_layers:
                     ik = torch.zeros(
                         (num_pages, self.page_size, 1, self.index_head_dim),
                         dtype=self.store_dtype,
@@ -265,8 +314,11 @@ class MLAKVOffloader:
 
         Manages the async send / recv pipeline so that non-owned layer
         data is available when attention needs it.
+
+        Non-sharing layers are a no-op — every rank has a dedicated buffer
+        and no communication is required.
         """
-        if self.tp_size <= 1:
+        if self.tp_size <= 1 or not self._is_sharing_layer(local_layer_id):
             return
 
         if local_layer_id in self._owned_layers:
