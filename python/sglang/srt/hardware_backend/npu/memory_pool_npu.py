@@ -419,10 +419,6 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             cache_v.view(-1, 1, self.qk_rope_head_dim),
         )
 
-    def sync_after_prefill(self):
-        """Synchronise all shared buffers after the first (prefill) forward pass."""
-        self._offloader.sync_after_prefill()
-
     def set_index_k_buffer(
         self,
         layer_id: int,

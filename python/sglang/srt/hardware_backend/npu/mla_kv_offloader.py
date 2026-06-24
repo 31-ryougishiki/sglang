@@ -22,8 +22,6 @@ Usage::
     offloader.pre_load(local_layer_id)
     # write K/V to offloader.k_buffer[local_layer_id] / v_buffer[local_layer_id]
     ...
-    # After prefill:
-    offloader.sync_after_prefill()
 """
 
 from __future__ import annotations
@@ -404,58 +402,6 @@ class MLAKVOffloader:
             self._pending_recv_layer = recv_layer
 
         self._next_recv_idx = (self._next_recv_idx + 1) % len(self._recv_layers)
-
-    # ------------------------------------------------------------------
-    # Post-prefill synchronisation
-    # ------------------------------------------------------------------
-
-    def sync_after_prefill(self) -> None:
-        """Full barrier + broadcast of all owned layer buffers to peers.
-
-        Must be called **once** after the first (prefill) forward pass and
-        before the first decode step.  This ensures all ranks have correct
-        data in shared buffers before the decode pipeline starts.
-        """
-        if self.tp_size <= 1:
-            return
-
-        # Drain any in-flight operations from the prefill forward pass
-        if self._pending_recv is not None:
-            for handle in self._pending_recv:
-                handle.wait()
-            self._pending_recv = None
-            self._pending_recv_layer = None
-        self._wait_pending_sends()
-
-        # Reset pipeline indices for the decode phase
-        self._next_owned_idx = 0
-        self._next_recv_idx = 0
-        self._next_peer_idx = 0
-
-        # Broadcast every layer from its owner to all peers
-        for local_layer_id in range(self.layer_num):
-            owner = local_layer_id % self.tp_size
-            if self._share_k:
-                dist.broadcast(
-                    self.k_buffer[local_layer_id],
-                    src=owner,
-                    group=self._offload_group,
-                )
-            if self._share_v:
-                dist.broadcast(
-                    self.v_buffer[local_layer_id],
-                    src=owner,
-                    group=self._offload_group,
-                )
-            if self._share_ik and self.index_k_buffer is not None:
-                dist.broadcast(
-                    self.index_k_buffer[local_layer_id],
-                    src=owner,
-                    group=self._offload_group,
-                )
-
-        # Post the first recv so the decode pipeline starts with data in-flight
-        self._post_recv_ahead()
 
     # ------------------------------------------------------------------
     # Utility
