@@ -3,6 +3,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.hardware_backend.npu.mla_kv_offloader import MLAKVOffloader
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
@@ -291,59 +292,33 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
         self.custom_mem_pool = None
 
+        # Cross-rank KV buffer sharing via MLAKVOffloader.
+        # Supports k_buffer + v_buffer sharing for arbitrary TP sizes.
+        _tp_rank = torch.distributed.get_rank()
+        _tp_size = torch.distributed.get_world_size()
+
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            # The padded slot 0 is used for writing dummy outputs from padded tokens.
-            self.k_buffer = torch.zeros(
-                (
-                    layer_num,
-                    self.size // self.page_size + 1,
-                    self.page_size,
-                    1,
-                    self.kv_lora_rank,
-                ),
-                dtype=self.store_dtype,
+            self._offloader = MLAKVOffloader(
+                layer_num=layer_num,
+                tp_rank=_tp_rank,
+                tp_size=_tp_size,
+                kv_lora_rank=kv_lora_rank,
+                qk_rope_head_dim=qk_rope_head_dim,
+                store_dtype=self.store_dtype,
                 device=self.device,
+                size=self.size,
+                page_size=self.page_size,
+                index_head_dim=index_head_dim,
             )
-            self.v_buffer = torch.zeros(
-                (
-                    layer_num,
-                    self.size // self.page_size + 1,
-                    self.page_size,
-                    1,
-                    self.qk_rope_head_dim,
-                ),
-                dtype=self.store_dtype,
-                device=self.device,
-            )
-            self.index_k_buffer = None
-            if self.index_head_dim is not None:
-                self.index_k_buffer = torch.zeros(
-                    (
-                        layer_num,
-                        self.size // self.page_size + 1,
-                        self.page_size,
-                        1,
-                        self.index_head_dim,
-                    ),
-                    dtype=self.store_dtype,
-                    device=self.device,
-                )
+
+            self.k_buffer = self._offloader.k_buffer
+            self.v_buffer = self._offloader.v_buffer
+            self.index_k_buffer = self._offloader.index_k_buffer
 
         self._finalize_allocation_log(size)
 
     def get_kv_size_bytes(self):
-        assert hasattr(self, "k_buffer")
-        assert hasattr(self, "v_buffer")
-        kv_size_bytes = 0
-        for k_cache in self.k_buffer:
-            kv_size_bytes += get_tensor_size_bytes(k_cache)
-        for v_cache in self.v_buffer:
-            kv_size_bytes += get_tensor_size_bytes(v_cache)
-        if self.index_head_dim is not None:
-            assert hasattr(self, "index_k_buffer")
-            for index_k_cache in self.index_k_buffer:
-                kv_size_bytes += get_tensor_size_bytes(index_k_cache)
-        return kv_size_bytes
+        return self._offloader.get_kv_size_bytes()
 
     def get_kv_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
@@ -417,6 +392,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         cache_v: torch.Tensor,
     ):
         layer_id = layer.layer_id
+        self._offloader.pre_load(layer_id - self.start_layer)
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
             cache_v = cache_v.to(self.dtype)
@@ -442,6 +418,10 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             loc.view(-1, 1),
             cache_v.view(-1, 1, self.qk_rope_head_dim),
         )
+
+    def sync_after_prefill(self):
+        """Synchronise all shared buffers after the first (prefill) forward pass."""
+        self._offloader.sync_after_prefill()
 
     def set_index_k_buffer(
         self,
